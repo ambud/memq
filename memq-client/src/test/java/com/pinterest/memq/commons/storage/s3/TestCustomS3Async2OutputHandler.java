@@ -21,15 +21,19 @@ import static org.junit.Assert.fail;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import org.junit.Test;
 
 import com.codahale.metrics.MetricRegistry;
+import com.pinterest.memq.core.commons.Message;
 
 public class TestCustomS3Async2OutputHandler {
 
@@ -41,7 +45,7 @@ public class TestCustomS3Async2OutputHandler {
     handler.initWriter(props, "test", new MetricRegistry());
     List<CompletableFuture<CustomS3Async2StorageHandler.UploadResult>> tasks = new ArrayList<>();
 
-    for(int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 5; i++) {
       final int j = i;
       tasks.add(CompletableFuture.supplyAsync(() -> {
         try {
@@ -53,7 +57,8 @@ public class TestCustomS3Async2OutputHandler {
     }
 
     try {
-      CustomS3Async2StorageHandler.UploadResult r = handler.anyUploadResultOrTimeout(tasks, Duration.ofMillis(1000)).get();
+      CustomS3Async2StorageHandler.UploadResult r = handler
+          .anyUploadResultOrTimeout(tasks, Duration.ofMillis(1000)).get();
       assertEquals(r.getKey(), "task-1");
     } catch (Exception e) {
       fail("Should not fail: " + e);
@@ -61,7 +66,7 @@ public class TestCustomS3Async2OutputHandler {
 
     tasks.clear();
 
-    for(int i = 1; i <= 5; i++) {
+    for (int i = 1; i <= 5; i++) {
       final int j = i;
       tasks.add(CompletableFuture.supplyAsync(() -> {
         try {
@@ -73,7 +78,8 @@ public class TestCustomS3Async2OutputHandler {
     }
 
     try {
-      CustomS3Async2StorageHandler.UploadResult r = handler.anyUploadResultOrTimeout(tasks, Duration.ofMillis(1000)).get();
+      CustomS3Async2StorageHandler.UploadResult r = handler
+          .anyUploadResultOrTimeout(tasks, Duration.ofMillis(1000)).get();
       fail("Should timeout");
     } catch (ExecutionException ee) {
       System.out.println(ee);
@@ -81,5 +87,45 @@ public class TestCustomS3Async2OutputHandler {
     } catch (Exception e) {
       fail("Should throw timeout exception");
     }
+  }
+
+  @Test
+  public void testAsyncUpload() throws Exception {
+    CustomS3Async2StorageHandler handler = new CustomS3Async2StorageHandler();
+    Properties props = new Properties();
+    props.setProperty("bucket", "test");
+    props.setProperty("retryTimeoutMillis", "500");
+    handler.initWriter(props, "test", new MetricRegistry());
+
+    Message m1 = new Message(1024, false);
+    m1.put("adasdas".getBytes("utf-8"));
+    Message m2 = new Message(512, false);
+    m2.put("abcdefgh".getBytes("utf-8"));
+    Message m3 = new Message(128, false);
+    m3.put("123456789".getBytes("utf-8"));
+    List<Message> messages = Arrays.asList(m1, m2, m3);
+
+    CompletableFuture<Void> future = new CompletableFuture<Void>();
+    int sizeInBytes = messages.stream().mapToInt(b -> b.getBuf().writerIndex()).sum();
+    for (int i = 0; i < 30; i++) {
+      final int k = i;
+      handler.writeOutputAsync(sizeInBytes, 0, messages, (ex) -> {
+        if (ex != null) {
+          ex.printStackTrace();
+        } else {
+          System.out.println("Request completed:" + k);
+        }
+      });
+    }
+    handler.writeOutputAsync(sizeInBytes, 0, messages, (ex) -> {
+      if (ex != null) {
+        ex.printStackTrace();
+      } else {
+        System.out.println("Request completed");
+      }
+    });
+    future.get();
+    handler.getExecutionTimer().shutdown();
+    handler.getExecutionTimer().awaitTermination(10, TimeUnit.SECONDS);
   }
 }

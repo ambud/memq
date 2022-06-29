@@ -15,23 +15,22 @@
  */
 package com.pinterest.memq.commons.storage.s3;
 
+import java.net.MalformedURLException;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.time.Duration;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -39,8 +38,6 @@ import java.util.stream.Collectors;
 
 import javax.naming.ConfigurationException;
 
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.CompositeByteBuf;
 import org.apache.commons.codec.digest.DigestUtils;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscription;
@@ -59,13 +56,18 @@ import com.pinterest.memq.core.utils.MemqUtils;
 import com.pinterest.memq.core.utils.MiscUtils;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.ByteBufAllocator;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.handler.codec.http.HttpHeaders;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.util.ReferenceCounted;
 import reactor.core.publisher.Mono;
 import reactor.netty.http.client.HttpClient;
 import reactor.netty.http.client.HttpClientResponse;
+import reactor.netty.resources.ConnectionProvider;
 import software.amazon.awssdk.auth.credentials.InstanceProfileCredentialsProvider;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest.Builder;
@@ -109,7 +111,6 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
   private S3Presigner signer;
   private HttpClient secureClient;
   private MetricRegistry registry;
-  private ExecutorService requestExecutor;
   private ScheduledExecutorService executionTimer;
 
   private Timer s3PutLatencyTimer;
@@ -119,6 +120,7 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
   private Counter s3RequestCounter;
   private Counter notificationFailureCounter;
   private Counter timeoutExceptionCounter;
+  private Function3<Integer, String, String, URL> urlGenerator;
 
   public CustomS3Async2StorageHandler() {
   }
@@ -162,18 +164,35 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
     }
 
     this.path = outputHandlerConfig.getProperty("path", topic);
-    this.requestExecutor = Executors.newCachedThreadPool(new DaemonThreadFactory());
     this.executionTimer = Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory());
     this.s3RetryCounters = registry.counter("output.s3.retries");
     this.retryTimeoutMillis = Integer
         .parseInt(outputHandlerConfig.getProperty("retryTimeoutMillis", "5000"));
     this.maxAttempts = Integer.parseInt(outputHandlerConfig.getProperty("retryCount", "2")) + 1;
-    this.secureClient = HttpClient.create().option(ChannelOption.SO_SNDBUF, 4 * 1024 * 1024)
-        .option(ChannelOption.SO_LINGER, 0).secure();
-    signer = S3Presigner.builder()
-        .credentialsProvider(InstanceProfileCredentialsProvider.builder()
-            .asyncCredentialUpdateEnabled(true).asyncThreadName("IamCredentialUpdater").build())
-        .build();
+    boolean debug = true;
+    if (!debug) {
+      this.secureClient = HttpClient.create().option(ChannelOption.SO_SNDBUF, 4 * 1024 * 1024)
+          .option(ChannelOption.SO_LINGER, 0).secure();
+      signer = S3Presigner.builder()
+          .credentialsProvider(InstanceProfileCredentialsProvider.builder()
+              .asyncCredentialUpdateEnabled(true).asyncThreadName("IamCredentialUpdater").build())
+          .build();
+      urlGenerator = (contentLength, contentMD5, keyUrl) -> s3UrlGenerator(contentLength,
+          contentMD5, keyUrl);
+    } else {
+      ConnectionProvider provider = ConnectionProvider.create("localhost", 10);
+      EventLoopGroup loop =  new NioEventLoopGroup();
+      this.secureClient = HttpClient.create(provider)
+          .option(ChannelOption.SO_SNDBUF, 4 * 1024 * 1024).option(ChannelOption.SO_LINGER, 0).runOn(loop);
+      urlGenerator = (contentLength, contentMD5, keyUrl) -> {
+        try {
+          return new URL("http://localhost:9000");
+        } catch (MalformedURLException e) {
+          return null;
+        }
+      };
+
+    }
   }
 
   @Override
@@ -192,9 +211,10 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
   }
 
   @Override
-  public void writeOutput(int objectSize,
-                          int checksum,
-                          final List<Message> messages) throws WriteFailedException {
+  public void writeOutputAsync(int objectSize,
+                               int checksum,
+                               final List<Message> messages,
+                               Consumer<Exception> outputConsumer) throws WriteFailedException {
     Context timer = s3PutLatencyTimer.time();
     ByteBuf batchHeader = StorageHandler.getBatchHeadersAsByteArray(messages);
     final List<ByteBuf> messageBuffers = messageToBufferList(messages);
@@ -203,137 +223,131 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
       final int currentMaxAttempts = maxAttempts;
       final int currentRetryTimeoutMs = retryTimeoutMillis;
 
-      int contentLength = batchHeader.writerIndex() + objectSize;
+      final int contentLength = batchHeader.writerIndex() + objectSize;
       String contentMD5 = null;
-      UploadResult result = null;
-      boolean hasSucceeded = false;
-      int attempt = 0;
-      Message firstMessage = messages.get(0);
-      // map used for cancellation
-      Map<String, Future<UploadResult>> futureMap = new HashMap<>();
-      Map<String, CompletableFuture<UploadResult>> taskMap = new HashMap<>();
+      final Message firstMessage = messages.get(0);
+
       final Publisher<ByteBuf> bodyPublisher = getBodyPublisher(messageBuffers, batchHeader);
-      while (attempt < currentMaxAttempts) {
-        final int timeout = attempt == currentMaxAttempts - 1 ? LAST_ATTEMPT_TIMEOUT
-            : currentRetryTimeoutMs;
 
-        final int k = attempt;
-        final String key = createKey(firstMessage.getClientRequestId(),
-            firstMessage.getServerRequestId(), k).toString();
-        CompletableFuture<UploadResult> task = new CompletableFuture<>();
-        Callable<UploadResult> uploadAttempt = () -> {
-          try {
-            UploadResult ur = attemptUpload(bodyPublisher, objectSize, checksum, contentLength,
-                contentMD5, key, k, 0);
-            task.complete(ur);
-            return ur;
-          } catch (Exception e) {
-            task.completeExceptionally(e);
-            throw e;
-          }
-        };
-        Future<UploadResult> future = requestExecutor.submit(uploadAttempt);
-        futureMap.put(key, future);
-        taskMap.put(key, task);
+      class UploadRequest implements Runnable {
 
-        CompletableFuture<UploadResult> resultFuture = anyUploadResultOrTimeout(taskMap.values(),
-            Duration.ofMillis(timeout));
-        try {
-          result = resultFuture.get();
-          // start tracking response codes from s3
-          registry.counter("output.s3.responseCode." + result.getResponseCode()).inc();
-          if (result.getResponseCode() == SUCCESS_CODE) {
-            hasSucceeded = true;
-            break;
-          } else {
-            // remove the task so that it doesn't short circuit the next iteration
-            taskMap.remove(result.getKey());
-            logger.severe("Request failed reason:" + result + " attempt:" + result.getAttempt());
-            if (result.getResponseCode() >= 500 && result.getResponseCode() < 600) {
-              // retry 500s without increasing attempts
-              s3RetryCounters.inc();
-              // TODO: add circuit breaker for too many S3 failures
-              continue;
+        // map used for cancellation
+        int attempt = 0;
+        final Map<String, Mono<HttpClientResponse>> taskMap = new ConcurrentHashMap<>();
+        final AtomicBoolean successIndicator = new AtomicBoolean(false);
+
+        @Override
+        public void run() {
+          if (!successIndicator.get() && attempt < currentMaxAttempts) {
+            // reschedule a check in retry millis
+            final int timeout = attempt == currentMaxAttempts - 1 ? LAST_ATTEMPT_TIMEOUT
+                : currentRetryTimeoutMs;
+            executionTimer.schedule(this, timeout, TimeUnit.MILLISECONDS);
+
+            final int k = attempt;
+            final String key = createKey(firstMessage.getClientRequestId(),
+                firstMessage.getServerRequestId(), k).toString();
+
+            try {
+              Mono<HttpClientResponse> attemptMono = attemptUpload(bodyPublisher, objectSize,
+                  checksum, contentLength, contentMD5, key, k, 0, urlGenerator, (result) -> {
+                    // start tracking response codes from s3
+                    registry.counter("output.s3.responseCode." + result.getResponseCode()).inc();
+                    if (result.getResponseCode() == SUCCESS_CODE) {
+                      // fence callback execution
+                      if (successIndicator.getAndSet(true)) {
+                        // skip the next steps if another task has already succeeded
+                        return;
+                      }
+
+                      Exception ex = null;
+                      if (!disableNotifications) {
+
+                        Context publishTime = notificationPublishingTimer.time();
+                        JsonObject payload = buildPayload(topic, bucket, objectSize,
+                            messages.size(), batchHeader.capacity(), result.getKey(),
+                            result.getAttempt());
+                        try {
+                          notificationSink.notify(payload, 0);
+                        } catch (Exception e) {
+                          ex = e;
+                          notificationFailureCounter.inc();
+                        } finally {
+                          publishTime.stop();
+                        }
+                      }
+                      long latency = timer.stop() / NANOSECONDS_TO_SECONDS;
+                      if (latency > HIGH_LATENCY_THRESHOLD) {
+                        final String s3path = "s3://" + bucket + SLASH + result.getKey();
+                        logger.info("Uploaded " + s3path + " latency(" + latency
+                            + ")s, successful on attempt " + result.getAttempt() + ", total tasks: "
+                            + taskMap.size());
+                      }
+                      release(batchHeader, messageBuffers);
+                      outputConsumer.accept(ex);
+                      timer.stop();
+                    } else {
+                      // remove the task so that it doesn't short circuit the next iteration
+                      taskMap.remove(result.getKey());
+                      logger.severe(
+                          "Request failed reason:" + result + " attempt:" + result.getAttempt());
+                      if (result.getResponseCode() >= 500 && result.getResponseCode() < 600) {
+                        // retry 500s without increasing attempts
+                        s3RetryCounters.inc();
+                      }
+                      if (taskMap.isEmpty()) {
+                        release(batchHeader, messageBuffers);
+                        outputConsumer
+                            .accept(new WriteFailedException("Reason:" + result.responseCode));
+                        timer.stop();
+                      }
+                    }
+                  });
+              taskMap.put(key, attemptMono);
+            } catch (URISyntaxException e) {
+              // TODO Auto-generated catch block
+              e.printStackTrace();
             }
+            attempt++;
+            s3RetryCounters.inc();
           }
-        } catch (ExecutionException ee) {
-          if (ee.getCause() instanceof TimeoutException) {
-            timeoutExceptionCounter.inc();
-          } else {
-            logger.log(Level.SEVERE, "Request failed", ee);
-          }
-        } catch (Exception e) {
-          logger.log(Level.SEVERE, "Request failed", e);
         }
-        attempt++;
-        s3RetryCounters.inc();
       }
+      
+      UploadRequest task = new UploadRequest();
+      task.run();
+      executionTimer.schedule(task, currentRetryTimeoutMs, TimeUnit.MILLISECONDS);
 
-      // best effort cancel all outstanding uploads, no matter what the result is
-      for (Map.Entry<String, Future<UploadResult>> entry : futureMap.entrySet()) {
-        if (result != null && entry.getKey().equals(result.getKey())) {
-          continue;
-        }
-        entry.getValue().cancel(true);
-      }
-
-      if (result == null) {
-        throw new WriteFailedException("All upload attempts failed");
-      } else if (!hasSucceeded) {
-        throw new WriteFailedException(
-            "Upload failed due to error out: s3://" + bucket + "/" + result.getKey());
-      }
-      if (!disableNotifications) {
-        Context publishTime = notificationPublishingTimer.time();
-        JsonObject payload = buildPayload(topic, bucket, objectSize, messages.size(),
-            batchHeader.capacity(), result.getKey(), result.getAttempt());
-        if (contentMD5 != null) {
-          payload.addProperty(CONTENT_MD5, contentMD5);
-        }
-        try {
-          notificationSink.notify(payload, 0);
-        } catch (Exception e) {
-          notificationFailureCounter.inc();
-          throw e;
-        } finally {
-          publishTime.stop();
-        }
-      }
-      long latency = timer.stop() / NANOSECONDS_TO_SECONDS;
-      if (latency > HIGH_LATENCY_THRESHOLD) {
-        final String s3path = "s3://" + bucket + SLASH + result.getKey();
-        logger.info("Uploaded " + s3path + " latency(" + latency + ")s, successful on attempt "
-            + result.getAttempt() + ", total tasks: " + futureMap.size());
-      }
     } catch (Exception e) {
       timer.stop();
-      throw new WriteFailedException(e);
-    } finally {
-      messageBuffers.forEach(ReferenceCounted::release);
-      batchHeader.release();
+      outputConsumer.accept(e);
+      release(batchHeader, messageBuffers);
     }
   }
 
-  private UploadResult attemptUpload(final Publisher<ByteBuf> bodyPublisher,
-                                     int sizeInBytes,
-                                     int checksum,
-                                     int contentLength,
-                                     String contentMD5,
-                                     final String key,
-                                     final int count,
-                                     int timeout) throws URISyntaxException {
+  private void release(ByteBuf batchHeader, final List<ByteBuf> messageBuffers) {
+    messageBuffers.forEach(ReferenceCounted::release);
+    batchHeader.release();
+  }
+
+  @FunctionalInterface
+  interface Function3<One, Two, Three, Return> {
+    public Return apply(One one, Two two, Three three);
+  }
+
+  private Mono<HttpClientResponse> attemptUpload(final Publisher<ByteBuf> bodyPublisher,
+                                                 int sizeInBytes,
+                                                 int checksum,
+                                                 int contentLength,
+                                                 String contentMD5,
+                                                 final String key,
+                                                 final int count,
+                                                 int timeout,
+                                                 Function3<Integer, String, String, URL> urlGenerator,
+                                                 final Consumer<UploadResult> resultConsumer) throws URISyntaxException {
     Context internalLatency = s3PutInternalLatencyTimer.time();
     try {
-      Builder putRequestBuilder = PutObjectRequest.builder().bucket(bucket).key(key);
-      if (contentMD5 != null) {
-        putRequestBuilder.contentMD5(contentMD5);
-      }
-      putRequestBuilder.contentLength((long) contentLength);
-      PresignedPutObjectRequest presignPutObject = signer.presignPutObject(
-          PutObjectPresignRequest.builder().putObjectRequest(putRequestBuilder.build())
-              .signatureDuration(Duration.ofSeconds(2000)).build());
-
-      URL url = presignPutObject.url();
+      URL url = urlGenerator.apply(contentLength, contentMD5, key);
       s3RequestCounter.inc();
       Mono<HttpClientResponse> responseFuture = secureClient.headers(headers -> {
         headers.set(CONTENT_TYPE, APPLICATION_OCTET_STREAM);
@@ -342,33 +356,49 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
         }
         headers.set(CONTENT_LENGTH, String.valueOf(contentLength));
       }).put().uri(url.toURI()).send(bodyPublisher).response();
-      HttpClientResponse response = responseFuture.block();
+      responseFuture.subscribe(response -> {
+        HttpResponseStatus status = response.status();
+        int responseCode = status.code();
+        HttpHeaders responseHeaders = response.responseHeaders();
 
-      HttpResponseStatus status = response.status();
-      int responseCode = status.code();
-      HttpHeaders responseHeaders = response.responseHeaders();
-
-      if (responseCode != SUCCESS_CODE) {
-        logger.severe(responseCode + " reason:" + status.reasonPhrase() + "\t" + responseHeaders
-            + " index:" + count + " url:" + url);
-      }
-
-      if (contentMD5 != null && responseCode == SUCCESS_CODE) {
-        try {
-          String eTagHex = responseHeaders.get(E_TAG);
-          String etagToBase64 = MemqUtils.etagToBase64(eTagHex.replace("\"", ""));
-          if (!contentMD5.equals(etagToBase64)) {
-            logger.severe("Request failed due to etag mismatch url:" + url);
-            responseCode = ERROR_CODE;
-          }
-        } catch (Exception e) {
-          logger.log(Level.SEVERE, "Unable to parse the returnedetag", e);
+        if (responseCode != SUCCESS_CODE) {
+          logger.severe(responseCode + " reason:" + status.reasonPhrase() + "\t" + responseHeaders
+              + " index:" + count + " url:" + url);
         }
-      }
-      return new UploadResult(key, responseCode, responseHeaders, internalLatency.stop(), count);
+
+        if (contentMD5 != null && responseCode == SUCCESS_CODE) {
+          try {
+            String eTagHex = responseHeaders.get(E_TAG);
+            String etagToBase64 = MemqUtils.etagToBase64(eTagHex.replace("\"", ""));
+            if (!contentMD5.equals(etagToBase64)) {
+              logger.severe("Request failed due to etag mismatch url:" + url);
+              responseCode = ERROR_CODE;
+            }
+          } catch (Exception e) {
+            logger.log(Level.SEVERE, "Unable to parse the returnedetag", e);
+          }
+        }
+        UploadResult uploadResult = new UploadResult(key, responseCode, responseHeaders,
+            internalLatency.stop(), count);
+        resultConsumer.accept(uploadResult);
+      }, t -> t.printStackTrace());
+
+      return responseFuture;
     } finally {
-      internalLatency.stop();
     }
+  }
+
+  private URL s3UrlGenerator(int contentLength, String contentMD5, final String key) {
+    Builder putRequestBuilder = PutObjectRequest.builder().bucket(bucket).key(key);
+    if (contentMD5 != null) {
+      putRequestBuilder.contentMD5(contentMD5);
+    }
+    putRequestBuilder.contentLength((long) contentLength);
+    PresignedPutObjectRequest presignPutObject = signer.presignPutObject(
+        PutObjectPresignRequest.builder().putObjectRequest(putRequestBuilder.build())
+            .signatureDuration(Duration.ofSeconds(2000)).build());
+    URL url = presignPutObject.url();
+    return url;
   }
 
   public static class UploadResult {
@@ -499,6 +529,17 @@ public class CustomS3Async2StorageHandler extends AbstractS3StorageHandler {
   @Override
   public Logger getLogger() {
     return logger;
+  }
+
+  public ScheduledExecutorService getExecutionTimer() {
+    return executionTimer;
+  }
+
+  @Override
+  public void writeOutput(int sizeInBytes,
+                          int checksum,
+                          List<Message> messages) throws WriteFailedException {
+    throw new WriteFailedException("Sync writes are not supported");
   }
 
 }

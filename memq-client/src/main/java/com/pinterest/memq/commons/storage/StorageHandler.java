@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Properties;
+import java.util.function.Consumer;
 
 import com.codahale.metrics.MetricRegistry;
 import com.google.gson.JsonObject;
@@ -54,6 +55,12 @@ public interface StorageHandler {
   void writeOutput(int sizeInBytes,
                    int checksum,
                    List<Message> messages) throws WriteFailedException;
+  
+  default void writeOutputAsync(int sizeInBytes,
+                   int checksum,
+                   List<Message> messages,
+                   Consumer<Exception> responseProcessor) throws WriteFailedException {
+  }
 
   String getReadUrl();
 

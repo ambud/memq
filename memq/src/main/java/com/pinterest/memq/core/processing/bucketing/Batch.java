@@ -99,10 +99,12 @@ public class Batch {
     this.sizeBasedBatchCounter = registry.counter("batching.sizedbasedbatch");
     this.timeBasedBatchCounter = registry.counter("batching.timebasedbatch");
     this.countBasedBatchCounter = registry.counter("batching.countbasedbatch");
-    this.accumulationTime = MiscUtils.oneMinuteWindowTimer(registry,"batching.accumulation.time");
+    this.accumulationTime = MiscUtils.oneMinuteWindowTimer(registry, "batching.accumulation.time");
   }
 
-  public void reset(long sizeDispatchThreshold, int countDispatchThreshold, Duration timeDispatchThreshold) {
+  public void reset(long sizeDispatchThreshold,
+                    int countDispatchThreshold,
+                    Duration timeDispatchThreshold) {
     startTime = System.currentTimeMillis();
     scheduleTimeBasedDispatch();
     usedCapacity.set(0);
@@ -136,8 +138,10 @@ public class Batch {
     timeDispatchTask = scheduler.schedule(() -> {
       if (!Thread.interrupted()) {
         if (System.currentTimeMillis() - startTime >= timeDispatchThreshold.toMillis()) {
-          // if wasAvailable == true, the payload was sealed due to time threshold, so we should try to dispatch
-          // if it was false, it means that a write has been initiated and sealed the payload, so the dispatching is on that write
+          // if wasAvailable == true, the payload was sealed due to time threshold, so we
+          // should try to dispatch
+          // if it was false, it means that a write has been initiated and sealed the
+          // payload, so the dispatching is on that write
           boolean wasAvailable = seal();
           if (wasAvailable && isReadyToUpload()) {
             tryDispatch(true);
@@ -162,13 +166,8 @@ public class Batch {
       if (usage < sizeDispatchThreshold) {
         int idx = messageIdx.getAndIncrement();
         if (idx < countDispatchThreshold) {
-          messages[idx] = Message.newInstance(
-              writePacket.getData().retainedSlice(),
-              clientRequestId,
-              serverRequestId,
-              ctx,
-              protocolVersion
-          );
+          messages[idx] = Message.newInstance(writePacket.getData().retainedSlice(),
+              clientRequestId, serverRequestId, ctx, protocolVersion);
           messagesCount.getAndIncrement();
           if (idx == countDispatchThreshold - 1) {
             // last message should shut the door and finalize the batch
@@ -253,12 +252,12 @@ public class Batch {
       this.uploadBytesCounter = registry.counter("output.uploadBytes");
       this.outputErrorCounter = registry.counter("output.error");
       this.ackChannelWriteError = registry.counter("acker.ackerror");
-      this.uploadLatency = MiscUtils.oneMinuteWindowTimer(registry,"output.uploadLatency");
-      this.ackLatency = MiscUtils.oneMinuteWindowTimer(registry,"acker.push.latency");
-      this.batchSizeBytes = registry.histogram("output.batchSizeBytes", () ->
-          new Histogram(new SlidingTimeWindowArrayReservoir(1, TimeUnit.MINUTES)));
-      this.batchMessageCountHistogram = registry.histogram("output.batchMessageCount", () ->
-          new Histogram(new SlidingTimeWindowArrayReservoir(1, TimeUnit.MINUTES)));
+      this.uploadLatency = MiscUtils.oneMinuteWindowTimer(registry, "output.uploadLatency");
+      this.ackLatency = MiscUtils.oneMinuteWindowTimer(registry, "acker.push.latency");
+      this.batchSizeBytes = registry.histogram("output.batchSizeBytes",
+          () -> new Histogram(new SlidingTimeWindowArrayReservoir(1, TimeUnit.MINUTES)));
+      this.batchMessageCountHistogram = registry.histogram("output.batchMessageCount",
+          () -> new Histogram(new SlidingTimeWindowArrayReservoir(1, TimeUnit.MINUTES)));
     }
 
     @Override
@@ -274,15 +273,27 @@ public class Batch {
       activeParallelTasks.inc();
       try {
         int checksum = CoreUtils.batchChecksum(messageList);
-        Timer.Context uploadTimer = uploadLatency.time();
-        handler.writeOutput(sizeInBytes, checksum, messageList);
-        uploadTimer.stop();
-        responseCode = ResponseCodes.OK;
-        updateSuccessMetrics(messageList, sizeInBytes);
+        final Timer.Context uploadTimer = uploadLatency.time();
+        handler.writeOutputAsync(sizeInBytes, checksum, messageList, (exception) -> {
+          short internalResponseCode = ResponseCodes.INTERNAL_SERVER_ERROR;
+          uploadTimer.stop();
+          if (exception != null) {
+            internalResponseCode = ResponseCodes.REQUEST_FAILED;
+            outputErrorCounter.inc();
+          } else {
+            internalResponseCode = ResponseCodes.OK;
+            updateSuccessMetrics(messageList, sizeInBytes);
+          }
+          activeParallelTasks.dec();
+          clearMessageBuffers(messageList);
+          ackMessages(messageList, internalResponseCode);
+          clear();
+          manager.recycle(Batch.this, isTimeBased);
+        });
+
       } catch (WriteFailedException | IOException e) {
         logger.log(Level.SEVERE, "Failed to upload batch: ", e);
         responseCode = ResponseCodes.REQUEST_FAILED;
-        outputErrorCounter.inc();
       } finally {
         activeParallelTasks.dec();
         clearMessageBuffers(messageList);
@@ -312,9 +323,9 @@ public class Batch {
         ChannelHandlerContext channelRef = m.getPipelineReference();
         if (channelRef != null) {
           try {
-            channelRef.writeAndFlush(new ResponsePacket(m.getClientProtocolVersion(),
-                m.getClientRequestId(), RequestType.WRITE, responseCode,
-                new WriteResponsePacket()));
+            channelRef.writeAndFlush(
+                new ResponsePacket(m.getClientProtocolVersion(), m.getClientRequestId(),
+                    RequestType.WRITE, responseCode, new WriteResponsePacket()));
           } catch (Exception e2) {
             ackChannelWriteError.inc();
           }

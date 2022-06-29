@@ -9,7 +9,7 @@ topicConfig:
       outputParallelism: 4
       batchSizeMB: 1
       batchMilliSeconds: 1
-      storageHandlerName: filesystem
+      storageHandlerName: devnull
       storageHandlerConfig:
         retryTimeoutMillis: 5000
         storageDirs: /Volumes/RAMDisk/val
